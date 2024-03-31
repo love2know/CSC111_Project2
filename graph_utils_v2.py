@@ -1,6 +1,6 @@
 """The new version of graphs."""
 from __future__ import annotations
-from typing import Optional, Any
+from typing import Optional, Any, TextIO
 from collections import deque
 from queue_utils import PriorityQueue
 import folium
@@ -31,6 +31,7 @@ class _Vertex:
         """Return the out-degree of this vertex."""
         return len(self.downstream)
 
+
 class _Edge:
     """An edge representing a road.
 
@@ -44,7 +45,8 @@ class _Edge:
     segments: set[_Segment]
     info: dict[str, Any]
 
-    def __init__(self, start_id: int, end_id: int, ogf_ids: set[int], length: float, segments: Optional[set[_Segment]] = None) -> None:
+    def __init__(self, start_id: int, end_id: int, ogf_ids: set[int], length: float,
+                 segments: Optional[set[_Segment]] = None) -> None:
         self.start_id = start_id
         self.end_id = end_id
         self.ogf_ids = ogf_ids
@@ -60,7 +62,7 @@ class _Edge:
         """
         total_time = 0.0
         for segment in self.segments:
-            total_time += segment.length / (segment.speed_limit * 1e3)
+            total_time += segment.seg_length / (segment.speed_limit * 1e3)
         self.info['travel_time'] = total_time
 
     def add_segment(self, segment: _Segment) -> None:
@@ -91,7 +93,7 @@ class _Segment:
     """
     corr_ogfid: int
     name: str
-    length: float
+    seg_length: float
     road_class: str
     speed_limit: int
     poly_line: folium.PolyLine
@@ -100,7 +102,7 @@ class _Segment:
                  name: str = '') -> None:
         self.corr_ogfid = ogfid
         self.name = name
-        self.length = length
+        self.seg_length = length
         self.road_class = road_class
         self.speed_limit = speed_limit
         self.poly_line = poly_line
@@ -114,6 +116,14 @@ class Graph:
     def __init__(self) -> None:
         self._vertices = {}
         self._edges = {}
+
+    def __contains__(self, item: int | tuple[int, int]) -> bool:
+        if isinstance(item, int):
+            return item in self._vertices
+        elif isinstance(item, tuple):
+            return item in self._edges
+        else:
+            raise ValueError
 
     def add_vertex(self, junc_id: int, coord: list[float], message: str = '') -> None:
         """Add a vertex to the graph. Do nothing if it already exists."""
@@ -138,8 +148,41 @@ class Graph:
         else:
             raise ValueError
 
+    def add_edge_with_segments(self, start_id: int, end_id: int, ogf_ids: set[int],
+                               length: float, weight_type: str, segments_info: list[tuple]) -> None:
+        """Add an edge containing segments with properties given by segments_info into the graph.
+        If an edge already exists from start_id to end_id, replace it if the new edge has a lower weight of type
+        weight_type and do nothing otherwise.
+        Raise ValueError if start_id not in self._vertices or end_id not in self._vertices.
+
+        Preconditions:
+            - all(seg_info[0] in ogf_ids for seg_info in segments_info)
+            - weight_type in {"distance", "travel_time"}
+        """
+        if start_id in self._vertices and end_id in self._vertices:
+            segments = set()
+            for ogf_id, seg_len, rc, speed_lim, coordinates, road_name in segments_info:
+                segments.add(_Segment(ogf_id, seg_len, rc, speed_lim,
+                                      folium.PolyLine(locations=coordinates,
+                                                      popup=f"name: {road_name}\n"
+                                                            f"length: {round(seg_len / 1e3, 3)}km,\n"
+                                                            f"road class: {rc},\n"
+                                                            f"speed limit: {speed_lim}km/h"),
+                                      road_name))
+            new_edge = _Edge(start_id, end_id, ogf_ids, length, segments)
+            if (start_id, end_id) not in self._edges:
+                u = self._vertices[start_id]
+                v = self._vertices[end_id]
+                u.downstream.add(v)
+                v.upstream.add(u)
+                self._edges[(start_id, end_id)] = new_edge
+            elif self._edges[(start_id, end_id)].info[weight_type] > new_edge.info[weight_type]:
+                self._edges[(start_id, end_id)] = new_edge
+        else:
+            raise ValueError
+
     def add_segment_to_edge(self, start_id: int, end_id: int,
-                            corr_ogfid: int, length: float,
+                            corr_ogfid: int, seg_length: float,
                             road_class: str, speed_limit: int,
                             coords: list[list[float]], name: str = '',
                             message: str = '') -> None:
@@ -151,9 +194,9 @@ class Graph:
             if corr_ogfid in edge.ogf_ids:
                 poly_line = folium.PolyLine(locations=coords,
                                             popup=f'road name: {name} \n road class: {road_class} \n'
-                                                  f'length: {length} \n speed limit: {speed_limit} \n'
+                                                  f'length: {seg_length} \n speed limit: {speed_limit} \n'
                                                   f'{message}')
-                segment = _Segment(corr_ogfid, length, road_class,
+                segment = _Segment(corr_ogfid, seg_length, road_class,
                                    speed_limit, poly_line, name)
                 edge.add_segment(segment)
         else:
@@ -171,6 +214,15 @@ class Graph:
     def edge_count(self) -> int:
         """Return the number of edges in the graph."""
         return len(self._edges)
+
+    def get_weight(self, start_id: int, end_id: int, weight_type: str) -> float:
+        """Return the weight of the edge from self._vertices[start_id] to self._vertices[end_id].
+        Raise ValueError if (start_id, end_id) is not in self._edges.
+        """
+        if (start_id, end_id) in self._edges:
+            return self._edges[(start_id, end_id)].info[weight_type]
+        else:
+            raise ValueError
 
     def remove_edge(self, start_id: int, end_id: int) -> None:
         """Removes an edge from start_id to end_id.
@@ -232,6 +284,99 @@ class Graph:
             return upstream_protection.union(downstream_protection)
         else:
             raise ValueError
+
+    def prune_v2(self, protected_ids: set[int], pruned_classes: set[str]) -> None:
+        """Improved version of pruning the graph."""
+        preserved_equiv_classes = self.get_preserved_equiv_classes(protected_ids, pruned_classes)
+        potentially_pruned_equiv_classes = self.get_pruned_equiv_classes(pruned_classes)
+        to_prune = set()
+        for pruned_equiv_class in potentially_pruned_equiv_classes:
+            count = 0
+            for preserved_equiv_class in preserved_equiv_classes:
+                if not pruned_equiv_class.isdisjoint(preserved_equiv_class):
+                    count += 1
+            if count <= 1:
+                to_prune.update(pruned_equiv_class)
+        edges = self._edges.copy()
+        for start_id, end_id in edges:
+            if start_id in to_prune and end_id in to_prune and (start_id, end_id) in self._edges and \
+                    self._edges[(start_id, end_id)].all_in_road_classes(pruned_classes):
+                self.remove_edge(start_id, end_id)
+
+    def get_preserved_equiv_classes(self, protected_ids: set[int], pruned_classes: set[str]) -> list[set[int]]:
+        """Return a list of sets of vertex ids satisfying the following properties:
+            - For every 2 sets in the returned list, they are disjoint.
+            - For every ordered pair (u, v) of vertices such that u.junc_id and v.junc_id are in the same set
+            in the returned list, it is possible to travel from u to v AND from v to u using a path that do not use
+            any road belonging to a class in pruned_classes.
+            - For every id in protected_ids, id is in a set in the returned list.
+        """
+        visited = set()
+        res = []
+        for k in self._vertices:
+            if k not in visited:
+                vertex = self._vertices[k]
+                to_check_downstream = deque([u.junc_id for u in vertex.downstream if
+                                             not self._edges[(k, u.junc_id)].all_in_road_classes(pruned_classes)])
+                to_check_upstream = deque([v.junc_id for v in vertex.upstream if
+                                           not self._edges[(v.junc_id, k)].all_in_road_classes(pruned_classes)])
+                if k in protected_ids or (len(to_check_upstream) > 0 and len(to_check_downstream) > 0):
+                    downstream_connected = {k}.union(set(to_check_downstream))
+                    upstream_connected = {k}.union(set(to_check_upstream))
+                    while len(to_check_downstream) > 0:
+                        u = self._vertices[to_check_downstream.popleft()]
+                        for v in u.downstream:
+                            if v.junc_id not in downstream_connected and \
+                                    not self._edges[(u.junc_id, v.junc_id)].all_in_road_classes(pruned_classes):
+                                downstream_connected.add(v.junc_id)
+                                to_check_downstream.append(v.junc_id)
+                    while len(to_check_upstream) > 0:
+                        u = self._vertices[to_check_upstream.popleft()]
+                        for v in u.upstream:
+                            if v.junc_id not in upstream_connected and \
+                                    not self._edges[(v.junc_id, u.junc_id)].all_in_road_classes(pruned_classes):
+                                upstream_connected.add(v.junc_id)
+                                to_check_upstream.append(v.junc_id)
+                    equivalence_class = downstream_connected.intersection(upstream_connected)
+                    visited.update(equivalence_class)
+                    res.append(equivalence_class)
+        return res
+
+    def get_pruned_equiv_classes(self, pruned_classes: set[str]) -> list[set[int]]:
+        """Return a list of sets of vertex ids satisfying the following properties:
+            - For any 2 sets in the returned list, they are disjoint.
+            - For any pair of ordered pair of vertices (u, v) such that u.junc_id and v.junc_id are in the same
+            set in the returned list, they are connected by roads belonging to pruned classes in an undirected sense.
+            (i.e. It would be possible to travel from u to v AND from v to u along a route that only
+            uses roads belonging to pruned classes if every road in the network permits traffic in both directions.)
+        """
+        visited = set()
+        res = []
+        for k in self._vertices:
+            if k not in visited:
+                vertex = self._vertices[k]
+                adjacent = vertex.upstream.union(vertex.downstream)
+                to_check = deque([u.junc_id for u in adjacent if
+                                  ((k, u.junc_id) in self._edges and
+                                   self._edges[(k, u.junc_id)].all_in_road_classes(pruned_classes)) or
+                                  ((u.junc_id, k) in self._edges and
+                                   self._edges[(u.junc_id, k)].all_in_road_classes(pruned_classes))])
+                if len(to_check) > 0:
+                    equivalence_class = {k}.union(set(to_check))
+                    while len(to_check) > 0:
+                        u = self._vertices[to_check.popleft()]
+                        cur_adjacent = u.upstream.union(u.downstream)
+                        for v in cur_adjacent:
+                            if v.junc_id not in equivalence_class:
+                                if ((u.junc_id, v.junc_id) in self._edges and
+                                    self._edges[(u.junc_id, v.junc_id)].all_in_road_classes(pruned_classes)) or \
+                                        ((v.junc_id, u.junc_id) in self._edges and
+                                         self._edges[(v.junc_id, u.junc_id)].all_in_road_classes(pruned_classes)):
+                                    equivalence_class.add(v.junc_id)
+                                    to_check.append(v.junc_id)
+                    visited.update(equivalence_class)
+                    res.append(equivalence_class)
+        return res
 
     def remove_redundant_vertices(self, weight_type: str, protected_ids: set[int]) -> None:
         """After pruning, since certain roads are removed, there will be some vertices
@@ -374,3 +519,34 @@ class Graph:
         m.add_child(self._vertices[route[-1]].marker)
         m.save(file_path)
         return m
+
+    def write_graph(self, output_file: TextIO, weight_type: str,
+                    vertices_of_interest: list[int], pruned_classes: set[str]) -> None:
+        """Write the graph to a txt file.
+
+        Preconditions:
+            - all(_id in self._vertices for _id in vertices_of_interest)
+        """
+        output_file.write(weight_type + "\n")
+        output_file.write(" ".join([str(junc_id) for junc_id in vertices_of_interest]) + "\n")
+        output_file.write("|".join(list(pruned_classes)) + "\n")
+        output_file.write(f"V {len(self._vertices)}\n")
+        for junc_id in self._vertices:
+            output_file.write(str(junc_id) + "\n")
+            output_file.write(" ".join([str(c) for c in self._vertices[junc_id].marker.location]) + "\n")
+        output_file.write(f"E {len(self._edges)}\n")
+        for start_id, end_id in self._edges:
+            edge = self._edges[(start_id, end_id)]
+            output_file.write(f"e {start_id} {end_id}\n")
+            output_file.write(" ".join([str(ogfid) for ogfid in edge.ogf_ids]) + "\n")
+            output_file.write(f"d {edge.info["distance"]}\n")
+            output_file.write(f"t {edge.info["travel_time"]}\n")
+            for segment in edge.segments:
+                output_file.write(f"S {segment.corr_ogfid}\n")
+                output_file.write(str(segment.seg_length) + "\n")
+                output_file.write(segment.road_class + "\n")
+                output_file.write(str(segment.speed_limit) + "\n")
+                locs = [f"{c[0]},{c[1]}" for c in segment.poly_line.locations]
+                output_file.write(" ".join(locs) + "\n")
+                output_file.write(segment.name + "\n")
+        output_file.write("END")
