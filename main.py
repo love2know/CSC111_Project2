@@ -1,7 +1,7 @@
 """The main module."""
 from typing import Optional, TextIO
-from preprocessing_v2 import data_to_graph_v3, read_prebuilt_graph
-from graph_utils_v2 import Graph
+from preprocessing import data_to_graph, read_prebuilt_graph
+from graph_utils import Graph
 import folium
 import webbrowser
 import os
@@ -39,6 +39,7 @@ SELECTED_DESTINATIONS = {6295901: "Rideau Canal",
 
 PRUNED_CLASSES = {"Local / Street", "Local / Strata", "Local / Unknown"}
 
+
 if __name__ == "__main__":
     road_graph = None
     weight_type = ''
@@ -61,12 +62,12 @@ if __name__ == "__main__":
             with open("data/ORN_Road_Elements.geojson", "r") as road_elem_data, \
                     open("data/ORN_Segments.geojson", "r") as segment_data:
                 print("Begin loading graph. This might take a while...")
-                road_graph = data_to_graph_v3(road_elem_data, segment_data,
-                                              weight_type, SELECTED_DESTINATIONS)
+                road_graph = data_to_graph(road_elem_data, segment_data,
+                                           weight_type, SELECTED_DESTINATIONS)
             print(f"Finished loading graph. "
                   f"{road_graph.vertex_count()} vertices, {road_graph.edge_count()} directed edges. ")
             print("Begin pruning graph. This might take a while...")
-            road_graph.prune_v2(set(SELECTED_DESTINATIONS.keys()), PRUNED_CLASSES)
+            road_graph.prune_graph(set(SELECTED_DESTINATIONS.keys()), PRUNED_CLASSES)
             print(f"Finished pruning graph. "
                   f"{road_graph.vertex_count()} vertices, {road_graph.edge_count()} directed edges. "
                   f"Begin removing redundant vertices.")
